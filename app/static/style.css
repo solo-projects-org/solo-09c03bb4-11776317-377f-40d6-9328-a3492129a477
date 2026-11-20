@@ -166,3 +166,24 @@ td.text { white-space: pre-wrap; }
 }
 .toast.show { display: block; }
 details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+
+/* Phrase verifications */
+.verify-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+.verify {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 10px 12px;
+}
+.verify .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.verify .phrase { font-weight: 600; white-space: pre-wrap; }
+.verify .meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.verify .state { font-size: 12px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--line); }
+.verify .state.confirmed { color: var(--ok); border-color: var(--ok-soft); background: #10201a; }
+.verify .state.not_found { color: var(--missing); border-color: #3a2024; background: #1b1416; }
+.verify .state.unverified { color: var(--pending); border-color: #3a3218; background: #221c0e; }
+.verify table { margin-top: 8px; }
+.verify th, .verify td { font-size: 12px; padding: 5px 6px; }
+.verify td.mono { font-family: var(--mono); white-space: nowrap; }
+.verify .uncovered { font-family: var(--mono); font-size: 11.5px; color: var(--missing); white-space: pre-wrap; }
+.verify .none { color: var(--muted); }

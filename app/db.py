@@ -14,12 +14,15 @@ captured segment back to pending or missing.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Optional
+
+from . import verify
 
 STATUS_PENDING = "pending"
 STATUS_CAPTURED = "captured"
@@ -79,7 +82,52 @@ CREATE TABLE IF NOT EXISTS cues (
 
 CREATE INDEX IF NOT EXISTS ix_cues_channel_time ON cues(channel_id, start_ms);
 CREATE INDEX IF NOT EXISTS ix_segments_channel_time ON segments(channel_id, start_ms);
+
+CREATE TABLE IF NOT EXISTS verifications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id      TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    phrase          TEXT NOT NULL,
+    from_ms         INTEGER NOT NULL,
+    to_ms           INTEGER NOT NULL,
+    created_ms      INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_judgments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    verification_id INTEGER NOT NULL REFERENCES verifications(id) ON DELETE CASCADE,
+    conclusion      TEXT NOT NULL CHECK (conclusion IN ('confirmed', 'not_found', 'unverified')),
+    first_seen_ms   INTEGER,
+    first_seen_seq  INTEGER,
+    matched_text    TEXT,
+    uncovered_json  TEXT NOT NULL,
+    created_ms      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_judgments_verification
+    ON verification_judgments(verification_id, id);
 """
+
+
+@dataclass
+class VerificationRow:
+    id: int
+    channel_id: str
+    phrase: str
+    from_ms: int
+    to_ms: int
+    created_ms: int
+
+
+@dataclass
+class JudgmentRow:
+    id: int
+    verification_id: int
+    conclusion: str
+    first_seen_ms: Optional[int]
+    first_seen_seq: Optional[int]
+    matched_text: Optional[str]
+    uncovered: tuple[tuple[int, int], ...]
+    created_ms: int
 
 
 @dataclass
@@ -130,6 +178,31 @@ def _row_to_segment(row: sqlite3.Row) -> SegmentRow:
         first_seen_ms=row["first_seen_ms"],
         captured_ms=row["captured_ms"],
         last_error=row["last_error"],
+    )
+
+
+def _row_to_verification(row: sqlite3.Row) -> VerificationRow:
+    return VerificationRow(
+        id=row["id"],
+        channel_id=row["channel_id"],
+        phrase=row["phrase"],
+        from_ms=row["from_ms"],
+        to_ms=row["to_ms"],
+        created_ms=row["created_ms"],
+    )
+
+
+def _row_to_judgment(row: sqlite3.Row) -> JudgmentRow:    return JudgmentRow(
+        id=row["id"],
+        verification_id=row["verification_id"],
+        conclusion=row["conclusion"],
+        first_seen_ms=row["first_seen_ms"],
+        first_seen_seq=row["first_seen_seq"],
+        matched_text=row["matched_text"],
+        uncovered=tuple(
+            (int(span[0]), int(span[1])) for span in json.loads(row["uncovered_json"])
+        ),
+        created_ms=row["created_ms"],
     )
 
 
@@ -311,7 +384,14 @@ class Database:
         captions_empty: bool,
         now: int,
     ) -> bool:
-        """Atomically store a segment's cues and mark it captured."""
+        """Atomically store a segment's cues and mark it captured.
+
+        The segment write and every verification judgment derived from it are
+        committed in one SQLite transaction.  A failure while writing a
+        judgment rolls back the capture too, so the archive never contains a
+        late segment whose knock-on judgment was lost.
+        """
+        cue_list = list(cues)
         with self._write_lock, self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -331,7 +411,7 @@ class Database:
                 """,
                 [
                     (channel_id, seq, cue.start_ms, cue.end_ms, cue.text)
-                    for cue in cues
+                    for cue in cue_list
                 ],
             )
             conn.execute(
@@ -342,8 +422,195 @@ class Database:
                 """,
                 (STATUS_CAPTURED, int(captions_empty), now, channel_id, seq),
             )
+            self._record_verification_judgments(conn, channel_id, now)
             conn.execute("COMMIT")
         return True
+
+    # ------------------------------------------------------------------
+    # Phrase verifications
+    # ------------------------------------------------------------------
+    def create_verification(
+        self,
+        channel_id: str,
+        phrase: str,
+        from_ms: int,
+        to_ms: int,
+        now: int,
+    ) -> tuple[VerificationRow, JudgmentRow]:
+        """Register a check and persist the judgment made at that moment."""
+        with self._write_lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute(
+                "SELECT 1 FROM channels WHERE id=?", (channel_id,)
+            ).fetchone() is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(channel_id)
+            cursor = conn.execute(
+                """
+                INSERT INTO verifications(channel_id, phrase, from_ms, to_ms, created_ms)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (channel_id, phrase, from_ms, to_ms, now),
+            )
+            verification_id = int(cursor.lastrowid)
+            judgment = self._insert_judgment(
+                conn, verification_id, self._evaluate_locked(conn, channel_id, phrase, from_ms, to_ms), now
+            )
+            conn.execute("COMMIT")
+        verification = VerificationRow(
+            id=verification_id,
+            channel_id=channel_id,
+            phrase=phrase,
+            from_ms=from_ms,
+            to_ms=to_ms,
+            created_ms=now,
+        )
+        return verification, judgment
+
+    def verifications(self, channel_id: str) -> list[VerificationRow]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM verifications WHERE channel_id=? ORDER BY id",
+                (channel_id,),
+            ).fetchall()
+        return [_row_to_verification(row) for row in rows]
+
+    def verifications_all(self) -> list[VerificationRow]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM verifications ORDER BY id"
+            ).fetchall()
+        return [_row_to_verification(row) for row in rows]
+
+    def get_verification(self, verification_id: int) -> Optional[VerificationRow]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM verifications WHERE id=?", (verification_id,)
+            ).fetchone()
+        return _row_to_verification(row) if row else None
+
+    def judgments(self, verification_id: int) -> list[JudgmentRow]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM verification_judgments
+                 WHERE verification_id=? ORDER BY id
+                """,
+                (verification_id,),
+            ).fetchall()
+        return [_row_to_judgment(row) for row in rows]
+
+    def _record_verification_judgments(
+        self, conn: sqlite3.Connection, channel_id: str, now: int
+    ) -> None:
+        """Append a judgment for every verification whose outcome just changed.
+
+        Called inside the capture transaction.  Only the latest judgment is
+        compared; re-fetches and restarts that leave it unchanged write
+        nothing, which is what keeps "same judgment, one row".
+        """
+        verifications = conn.execute(
+            """
+            SELECT id, phrase, from_ms, to_ms FROM verifications
+             WHERE channel_id=? ORDER BY id
+            """,
+            (channel_id,),
+        ).fetchall()
+        for verification in verifications:
+            latest = conn.execute(
+                """
+                SELECT conclusion, first_seen_ms FROM verification_judgments
+                 WHERE verification_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (verification["id"],),
+            ).fetchone()
+            if latest is None:
+                continue
+            judgment = self._evaluate_locked(
+                conn,
+                channel_id,
+                verification["phrase"],
+                verification["from_ms"],
+                verification["to_ms"],
+            )
+            if (
+                judgment.conclusion,
+                judgment.first_seen_ms,
+            ) == (latest["conclusion"], latest["first_seen_ms"]):
+                continue
+            self._insert_judgment(conn, verification["id"], judgment, now)
+
+    def _evaluate_locked(
+        self,
+        conn: sqlite3.Connection,
+        channel_id: str,
+        phrase: str,
+        from_ms: int,
+        to_ms: int,
+    ) -> verify.Judgment:
+        captured_rows = conn.execute(
+            """
+            SELECT * FROM segments
+             WHERE channel_id=? AND status=?
+             ORDER BY seq
+            """,
+            (channel_id, STATUS_CAPTURED),
+        ).fetchall()
+        cue_rows = conn.execute(
+            """
+            SELECT seq, start_ms, end_ms, text FROM cues
+             WHERE channel_id=?
+             ORDER BY seq, start_ms, end_ms, text
+            """,
+            (channel_id,),
+        ).fetchall()
+        captured = [_row_to_segment(row) for row in captured_rows]
+        captured_seqs = {segment.seq for segment in captured}
+        cues_by_seq: dict[int, list[CueRow]] = {}
+        for row in cue_rows:
+            if row["seq"] not in captured_seqs:
+                continue
+            cues_by_seq.setdefault(row["seq"], []).append(
+                CueRow(
+                    seq=row["seq"],
+                    start_ms=row["start_ms"],
+                    end_ms=row["end_ms"],
+                    text=row["text"],
+                )
+            )
+        return verify.evaluate(captured, cues_by_seq, from_ms, to_ms, phrase)
+
+    @staticmethod
+    def _insert_judgment(
+        conn: sqlite3.Connection, verification_id: int, judgment, now: int
+    ) -> JudgmentRow:
+        cursor = conn.execute(
+            """
+            INSERT INTO verification_judgments(
+                verification_id, conclusion, first_seen_ms, first_seen_seq,
+                matched_text, uncovered_json, created_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                verification_id,
+                judgment.conclusion,
+                judgment.first_seen_ms,
+                judgment.first_seen_seq,
+                judgment.matched_text,
+                json.dumps([list(span) for span in judgment.uncovered]),
+                now,
+            ),
+        )
+        return JudgmentRow(
+            id=int(cursor.lastrowid),
+            verification_id=verification_id,
+            conclusion=judgment.conclusion,
+            first_seen_ms=judgment.first_seen_ms,
+            first_seen_seq=judgment.first_seen_seq,
+            matched_text=judgment.matched_text,
+            uncovered=judgment.uncovered,
+            created_ms=now,
+        )
 
     def mark_fetch_failed(self, channel_id: str, seq: int, error: str, now: int) -> None:
         with self._write_lock, self.connect() as conn:

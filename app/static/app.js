@@ -4,6 +4,7 @@ const state = {
   channels: [],
   active: null,
   archive: null,
+  verifications: [],
   loading: false,
   demo: null,
 };
@@ -14,6 +15,12 @@ const STATUS_LABEL = {
   captured: "已取",
   pending: "待补",
   missing: "缺失",
+};
+
+const CONCLUSION_LABEL = {
+  confirmed: "证实",
+  not_found: "未出现",
+  unverified: "待证",
 };
 
 /* ------------------------------------------------------------------ */
@@ -302,8 +309,86 @@ function renderArchive() {
   }
 }
 
-function renderDemo() {
-  const node = $("#demo-state");
+function renderVerifications() {
+  const node = $("#verify-list");
+  const rows = state.verifications.filter(
+    (verification) => verification.channel_id === state.active
+  );
+  if (!rows.length) {
+    node.replaceChildren(
+      el("div", {
+        class: "empty-state",
+        text: "该频道还没有登记核查。填好原话与起止 UTC 后点“登记核查”。",
+      })
+    );
+    return;
+  }
+  node.replaceChildren(
+    ...rows.map((verification) => {
+      const current = verification.current;
+      const judgments = verification.judgments
+        .slice()
+        .reverse()
+        .map((judgment, index) =>
+          el("tr", {}, [
+            el("td", { class: "mono", text: fmtUtcFull(judgment.created_utc) }),
+            el("td", {}, [
+              el("span", {
+                class: `state ${judgment.conclusion}`,
+                text: CONCLUSION_LABEL[judgment.conclusion] || judgment.conclusion,
+              }),
+              index === 0
+                ? el("span", { class: "pill", text: "当前" })
+                : null,
+            ]),
+            el("td", { class: "mono", text: judgment.first_seen_utc || "—" }),
+            el("td", { class: "mono", text: judgment.first_seen_seq === null ? "—" : `#${judgment.first_seen_seq}` }),
+            el("td", { class: "text", text: judgment.matched_text || "—" }),
+            el(
+              "td",
+              { class: "uncovered" },
+              judgment.uncovered.length
+                ? judgment.uncovered
+                    .map((span) => `${fmtUtcFull(span.start_utc)} → ${fmtUtcFull(span.end_utc)}`)
+                    .join("\n")
+                : el("span", { class: "none", text: "无" })
+            ),
+          ])
+        );
+      return el("div", { class: "verify" }, [
+        el("div", { class: "head" }, [
+          el("span", { class: "phrase", text: verification.phrase }),
+          el("span", {
+            class: `state ${current ? current.conclusion : "unverified"}`,
+            text: current ? CONCLUSION_LABEL[current.conclusion] || current.conclusion : "待证",
+          }),
+          el("span", {
+            class: "meta",
+            text: `核查时段 ${verification.from_utc} → ${verification.to_utc}`,
+          }),
+          el("span", { class: "meta", text: `登记 ${verification.created_utc}` }),
+        ]),
+        el("div", { class: "table-wrap" }, [
+          el("table", {}, [
+            el("thead", {}, [
+              el("tr", {}, [
+                el("th", { text: "判断时刻" }),
+                el("th", { text: "结论" }),
+                el("th", { text: "首见 UTC" }),
+                el("th", { text: "片号" }),
+                el("th", { text: "命中原文" }),
+                el("th", { text: "未覆盖时段" }),
+              ]),
+            ]),
+            el("tbody", {}, judgments),
+          ]),
+        ]),
+      ]);
+    })
+  );
+}
+
+function renderDemo() {  const node = $("#demo-state");
   const demo = state.demo;
   if (!demo) {
     node.textContent = "演示源不可用（检查 origin 容器是否已启动）。";
@@ -328,6 +413,17 @@ function renderDemo() {
 /* ------------------------------------------------------------------ */
 /* Data flow                                                          */
 /* ------------------------------------------------------------------ */
+async function loadVerifications() {
+  try {
+    const payload = await api("/api/verifications");
+    state.verifications = payload.verifications;
+  } catch (error) {
+    state.verifications = [];
+    toast(`加载核查失败：${error.message}`, true);
+  }
+  renderVerifications();
+}
+
 async function loadArchive({ preserveInputs = false } = {}) {
   if (!state.active) return;
   const params = new URLSearchParams();
@@ -370,6 +466,7 @@ async function switchChannel(channelId) {
     await refreshDemo();
   }
   await loadArchive();
+  renderVerifications();
 }
 
 function captureSummary(result) {
@@ -416,6 +513,7 @@ async function runCapture(button, channelId = state.active, { quiet = false } = 
       button.textContent = label;
     }
     await loadArchive({ preserveInputs: true });
+    await loadVerifications();
     await refreshDemo();
   }
 }
@@ -530,6 +628,30 @@ async function boot() {
     await loadArchive();
   });
 
+  $("#verify-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const phrase = $("#verify-phrase").value;
+    const from = fromInputValue($("#verify-from").value);
+    const to = fromInputValue($("#verify-to").value);
+    if (!phrase) return toast("请填写要找的原话", true);
+    if (!from || !to) return toast("请填写核查起止 UTC", true);
+    try {
+      await api("/api/verifications", {
+        method: "POST",
+        body: JSON.stringify({
+          channel_id: state.active,
+          phrase,
+          from_at: from,
+          to_at: to,
+        }),
+      });
+      toast("已登记核查并保存当时判断");
+      await loadVerifications();
+    } catch (error) {
+      toast(`登记核查失败：${error.message}`, true);
+    }
+  });
+
   bindDemoControls();
 
   await refreshDemo();
@@ -538,6 +660,7 @@ async function boot() {
   } catch (error) {
     toast(`加载档案失败：${error.message}`, true);
   }
+  await loadVerifications();
 }
 
 boot().catch((error) => toast(`页面初始化失败：${error.message}`, true));

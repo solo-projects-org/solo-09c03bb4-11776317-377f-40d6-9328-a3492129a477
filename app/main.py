@@ -12,12 +12,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from .capture import CaptureService
 from .config import load_settings
-from .db import Database
+from .db import JudgmentRow, Database, VerificationRow
 from .timeline import build_view
-from .timeutil import iso_from_ms, parse_iso_ms
+from .timeutil import iso_from_ms, now_ms, parse_iso_ms
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -36,6 +37,55 @@ def _parse_time(value: Optional[str]) -> Optional[int]:
             status_code=400,
             detail=f"invalid UTC time {value!r}; expected ISO-8601 like 2026-11-20T00:01:00Z",
         )
+
+
+class VerificationRequest(BaseModel):
+    channel_id: str
+    phrase: str
+    from_at: str
+    to_at: str
+
+
+def _judgment_payload(row: JudgmentRow) -> dict:
+    return {
+        "id": row.id,
+        "conclusion": row.conclusion,
+        "first_seen_ms": row.first_seen_ms,
+        "first_seen_utc": iso_from_ms(row.first_seen_ms)
+        if row.first_seen_ms is not None
+        else None,
+        "first_seen_seq": row.first_seen_seq,
+        "matched_text": row.matched_text,
+        "uncovered": [
+            {
+                "start_ms": start,
+                "end_ms": end,
+                "start_utc": iso_from_ms(start),
+                "end_utc": iso_from_ms(end),
+            }
+            for start, end in row.uncovered
+        ],
+        "created_ms": row.created_ms,
+        "created_utc": iso_from_ms(row.created_ms),
+    }
+
+
+def _verification_payload(
+    row: VerificationRow, judgments: list[JudgmentRow]
+) -> dict:
+    return {
+        "id": row.id,
+        "channel_id": row.channel_id,
+        "phrase": row.phrase,
+        "from_ms": row.from_ms,
+        "to_ms": row.to_ms,
+        "from_utc": iso_from_ms(row.from_ms),
+        "to_utc": iso_from_ms(row.to_ms),
+        "created_ms": row.created_ms,
+        "created_utc": iso_from_ms(row.created_ms),
+        "judgments": [_judgment_payload(judgment) for judgment in judgments],
+        "current": _judgment_payload(judgments[-1]) if judgments else None,
+    }
 
 
 def create_app(
@@ -168,6 +218,63 @@ def create_app(
                 }
                 for segment in database.segments(channel_id)
             ]
+        }
+
+    # ------------------------------------------------------------------
+    # Phrase verification
+    # ------------------------------------------------------------------
+    @app.get("/api/verifications")
+    async def list_verifications():
+        result = []
+        for verification in database.verifications_all():
+            channel = next(
+                (item for item in channels if item["id"] == verification.channel_id),
+                None,
+            )
+            result.append(
+                {
+                    **_verification_payload(
+                        verification, database.judgments(verification.id)
+                    ),
+                    "channel_name": channel["name"] if channel else verification.channel_id,
+                }
+            )
+        return {"verifications": result}
+
+    @app.post("/api/verifications", status_code=201)
+    async def create_verification(body: VerificationRequest):
+        channel = channel_or_404(body.channel_id)
+        phrase = body.phrase
+        if not phrase:
+            raise HTTPException(status_code=400, detail="phrase must not be empty")
+        from_ms = _parse_time(body.from_at)
+        to_ms = _parse_time(body.to_at)
+        if from_ms is None or to_ms is None:
+            raise HTTPException(status_code=400, detail="from_at and to_at are required")
+        if to_ms <= from_ms:
+            raise HTTPException(status_code=400, detail="'to_at' must follow 'from_at'")
+        verification, _ = database.create_verification(
+            channel["id"], phrase, from_ms, to_ms, now_ms()
+        )
+        rows = database.judgments(verification.id)
+        return {
+            **_verification_payload(verification, rows),
+            "channel_name": channel["name"],
+        }
+
+    @app.get("/api/verifications/{verification_id}")
+    async def get_verification(verification_id: int):
+        verification = database.get_verification(verification_id)
+        if verification is None:
+            raise HTTPException(status_code=404, detail="unknown verification")
+        channel = next(
+            (item for item in channels if item["id"] == verification.channel_id), None
+        )
+        return {
+            **_verification_payload(
+                verification, database.judgments(verification.id)
+            ),
+            "channel_name": channel["name"] if channel else verification.channel_id,
         }
 
     # ------------------------------------------------------------------

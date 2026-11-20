@@ -78,6 +78,27 @@
       </div>
     </section>
 
+    <section class="panel">
+      <p class="section-title">原话首见核查</p>
+      <form class="row" id="verify-form">
+        <label class="field" style="flex:1;min-width:260px">
+          要找的原话（逐字，单条字幕匹配）
+          <input type="text" id="verify-phrase" placeholder="新闻｜第6段｜现场连线" autocomplete="off">
+        </label>
+        <label class="field">
+          核查起始 UTC
+          <input type="text" id="verify-from" placeholder="2026-11-20T00:00:00Z" autocomplete="off">
+        </label>
+        <label class="field">
+          核查结束 UTC
+          <input type="text" id="verify-to" placeholder="2026-11-20T00:02:00Z" autocomplete="off">
+        </label>
+        <button class="btn primary" type="submit">登记核查</button>
+      </form>
+      <div class="row"><span class="hint">按当前频道登记；登记时立即保存一次判断，之后每有片段入档且首见时刻或结论有变，自动追加一次判断。</span></div>
+      <div class="verify-list" id="verify-list"></div>
+    </section>
+
     <section class="panel demo">
       <div class="title" style="margin-bottom:10px">
         <span class="dot"></span>
